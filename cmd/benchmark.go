@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mattn/go-isatty"
@@ -201,20 +202,15 @@ func benchmark(c *cli.Context) error {
 	bigFileSize := c.Float64("big-file-size")
 	smallFileSize := c.Float64("small-file-size")
 	smallFileCount := c.Int("small-file-count")
+	concurrency := c.Uint("concurrency")
 
 	if c.NArg() > 0 {
 		dest = c.Args().Get(0)
 	}
 
-	var statPath string
-	var stats map[string]float64
-	for mp := dest; mp != "/"; mp = filepath.Dir(mp) {
-		if _, err := os.Stat(filepath.Join(mp, ".stats")); err == nil {
-			statPath = filepath.Join(mp, ".stats")
-			stats = readStats(statPath)
-			break
-		}
-	}
+	mp := findMountPoint(dest)
+	statPath := filepath.Join(mp, ".stats")
+	stats := readStats(statPath)
 
 	dest = filepath.Join(dest, fmt.Sprintf("__juicefs_benchmark_%d__", time.Now().UnixNano()))
 	if _, err := os.Stat(dest); os.IsNotExist(err) {
@@ -239,10 +235,23 @@ func benchmark(c *cli.Context) error {
 		return s
 	}
 
-	bigFileTest := newBenchmark(filepath.Join(dest, "bigfile"), bigFileSize, blockSize, 1)
-	timeTaken, totalSizeMiB := bigFileTest.WriteFileTest()
+	var bigFileTests []*Benchmark
+	for i := uint(0); i < concurrency; i++ {
+		bigFileTest := newBenchmark(filepath.Join(dest, "bigfile"), bigFileSize, blockSize, 1)
+		bigFileTests = append(bigFileTests, bigFileTest)
+	}
 
-	fmt.Printf("\rWritten a big file (%.2f MiB): (%.2f MiB/s)\n", bigFileTest.fileSizeMiB, totalSizeMiB/sum(timeTaken))
+	var wg sync.WaitGroup
+	for i := uint(0); i < concurrency; i++ {
+		wg.Add(1)
+		go func(bench *Benchmark) {
+			defer wg.Done()
+			timeTaken, totalSizeMiB := bench.WriteFileTest()
+			fmt.Printf("\rWritten a big file (%.2f MiB): (%.2f MiB/s)\n", bench.fileSizeMiB, totalSizeMiB/sum(timeTaken))
+		}(bigFileTests[i])
+	}
+
+	wg.Wait()
 
 	if os.Getuid() != 0 {
 		fmt.Println("Cleaning kernel cache, may ask for root privilege...")
@@ -253,9 +262,19 @@ func benchmark(c *cli.Context) error {
 	if os.Getuid() != 0 {
 		fmt.Println("Kernel cache cleaned")
 	}
-	timeTaken, totalSizeMiB = bigFileTest.ReadFileTest()
-	fmt.Printf("\rRead a big file (%.2f MiB): (%.2f MiB/s)\n", bigFileTest.fileSizeMiB, totalSizeMiB/sum(timeTaken))
 
+	for i := uint(0); i < concurrency; i++ {
+		wg.Add(1)
+		go func(bench *Benchmark) {
+			defer wg.Done()
+			timeTaken, totalSizeMiB := bench.ReadFileTest()
+			fmt.Printf("\rRead a big file (%.2f MiB): (%.2f MiB/s)\n", bench.fileSizeMiB, totalSizeMiB/sum(timeTaken))
+		}(bigFileTests[i])
+	}
+
+	wg.Wait()
+
+	var timeTaken []float64
 	smallFileTest := newBenchmark(filepath.Join(dest, "smallfile"), smallFileSize, blockSize, smallFileCount)
 	timeTaken, _ = smallFileTest.WriteFileTest()
 	fmt.Printf("\rWritten %d small files (%.2f KiB): %.1f files/s, %.1f ms for each file\n", smallFileTest.count, smallFileTest.fileSizeMiB*1024, float64(smallFileTest.count)/sum(timeTaken), sum(timeTaken)*1000/float64(smallFileTest.count))
@@ -303,6 +322,15 @@ func benchmark(c *cli.Context) error {
 	return nil
 }
 
+func findMountPoint(path string) string {
+	for mp := path; mp != "/"; mp = filepath.Dir(mp) {
+		if _, err := os.Stat(filepath.Join(mp, ".stats")); err == nil {
+			return mp
+		}
+	}
+	return ""
+}
+
 func benchmarkFlags() *cli.Command {
 	return &cli.Command{
 		Name:      "bench",
@@ -329,6 +357,11 @@ func benchmarkFlags() *cli.Command {
 				Name:  "small-file-count",
 				Value: 100,
 				Usage: "number of small files",
+			},
+			&cli.UintFlag{
+				Name:  "concurrency",
+				Value: 1,
+				Usage: "number of concurrent execution for each test",
 			},
 		},
 	}
