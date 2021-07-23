@@ -2920,14 +2920,19 @@ func (m *redisMeta) DumpMeta(w io.Writer) error {
 		return err
 	}
 	dels := make([]*DumpedDelFile, 0, len(zs))
-	for _, z := range zs {
+	delFiles := make([]DumpedDelFile, len(zs))
+	for i, z := range zs {
 		parts := strings.Split(z.Member.(string), ":")
 		if len(parts) != 2 {
 			return fmt.Errorf("invalid delfile string: %s", z.Member.(string))
 		}
 		inode, _ := strconv.ParseUint(parts[0], 10, 64)
 		length, _ := strconv.ParseUint(parts[1], 10, 64)
-		dels = append(dels, &DumpedDelFile{Ino(inode), length, int64(z.Score)})
+		f := delFiles[i]
+		f.Inode = Ino(inode)
+		f.Length = length
+		f.Expire = int64(z.Score)
+		dels = append(dels, &f)
 	}
 
 	tree, err := m.dumpEntry(m.root)
